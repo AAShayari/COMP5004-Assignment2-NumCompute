@@ -4,6 +4,7 @@ Classification and regression evaluation metrics.
 
 from __future__ import annotations
 from typing import Tuple
+from collections import deque
 import numpy as np
 
 
@@ -469,3 +470,152 @@ def auc(x: np.ndarray, y: np.ndarray) -> float:
         raise ValueError("X coordinates must be in ascending order.")
 
     return float(np.trapezoid(y, x))
+
+
+
+from collections import deque
+
+
+
+class StreamingMetrics:
+    """Calculate classification metrics as data arrives in chunks."""
+
+    def __init__(self, window_size=100):
+        if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size <= 0:
+            raise ValueError("window_size must be a positive integer.")
+
+        self.window_size = window_size
+        self.reset()
+
+    def reset(self):
+        """Clear all stored metric results."""
+        self.y_true_all = []
+        self.y_pred_all = []
+        self.y_score_all = []
+
+        self.scores_available = True
+
+        # Store recent actual and predicted labels.
+        self.recent_results = deque(maxlen=self.window_size)
+
+    def update(self, y_true_chunk, y_pred_chunk, y_score=None):
+        """Add the results from one new data chunk."""
+        y_true_chunk = np.asarray(y_true_chunk)
+        y_pred_chunk = np.asarray(y_pred_chunk)
+
+        if y_true_chunk.ndim != 1 or y_pred_chunk.ndim != 1:
+            raise ValueError("Inputs must be 1D arrays.")
+
+        if y_true_chunk.shape != y_pred_chunk.shape:
+            raise ValueError("Inputs must have the same shape.")
+
+        if y_true_chunk.size == 0:
+            raise ValueError("Input chunks cannot be empty.")
+
+        if y_score is not None:
+            y_score = np.asarray(y_score, dtype=float)
+
+            if y_score.ndim != 1 or y_score.shape != y_true_chunk.shape:
+                raise ValueError("y_score must have the same shape as y_true_chunk.")
+
+            if not np.all(np.isfinite(y_score)):
+                raise ValueError("Scores must contain finite values.")
+
+            if not np.all(np.isin(y_true_chunk, [0, 1])):
+                raise ValueError("AUC scores currently support binary labels 0 and 1.")
+
+        # Save the complete history for cumulative metrics.
+        self.y_true_all.extend(y_true_chunk.tolist())
+        self.y_pred_all.extend(y_pred_chunk.tolist())
+
+        if y_score is None:
+            self.scores_available = False
+        elif self.scores_available:
+            self.y_score_all.extend(y_score.tolist())
+
+        # Keep only the most recent samples for rolling metrics.
+        for actual, predicted in zip(y_true_chunk, y_pred_chunk):
+            self.recent_results.append((actual, predicted))
+
+    def _calculate_metrics(self, y_true, y_pred):
+        """Calculate accuracy, precision, recall, F1 and confusion matrix."""
+        matrix = confusion_matrix(y_true, y_pred)
+
+        true_positive = np.diag(matrix).astype(float)
+        predicted_total = np.sum(matrix, axis=0)
+        actual_total = np.sum(matrix, axis=1)
+
+        class_precision = np.divide(
+            true_positive,
+            predicted_total,
+            out=np.zeros_like(true_positive),
+            where=predicted_total != 0
+        )
+
+        class_recall = np.divide(
+            true_positive,
+            actual_total,
+            out=np.zeros_like(true_positive),
+            where=actual_total != 0
+        )
+
+        class_f1 = np.divide(
+            2 * class_precision * class_recall,
+            class_precision + class_recall,
+            out=np.zeros_like(class_precision),
+            where=(class_precision + class_recall) != 0
+        )
+
+        return {
+            "accuracy": float(np.mean(y_true == y_pred)),
+            "precision": float(np.mean(class_precision)),
+            "recall": float(np.mean(class_recall)),
+            "f1": float(np.mean(class_f1)),
+            "confusion_matrix": matrix
+        }
+
+    def result(self):
+        """Return cumulative and rolling classification metrics."""
+        if not self.y_true_all:
+            return {}
+
+        # Calculate metrics using the complete history.
+        y_true = np.asarray(self.y_true_all)
+        y_pred = np.asarray(self.y_pred_all)
+
+        results = self._calculate_metrics(y_true, y_pred)
+
+        results["classes"] = np.unique(np.concatenate((y_true, y_pred)))
+
+        # Calculate metrics using only the recent window.
+        recent_data = list(self.recent_results)
+
+        recent_true = np.asarray([item[0] for item in recent_data])
+        recent_pred = np.asarray([item[1] for item in recent_data])
+
+        rolling_results = self._calculate_metrics(
+            recent_true, recent_pred
+        )
+
+        results["rolling_accuracy"] = rolling_results["accuracy"]
+        results["rolling_precision"] = rolling_results["precision"]
+        results["rolling_recall"] = rolling_results["recall"]
+        results["rolling_f1"] = rolling_results["f1"]
+        results["rolling_confusion_matrix"] = rolling_results["confusion_matrix"]
+
+        # Calculate AUC only when scores were supplied for every update.
+        if (
+            self.scores_available
+            and self.y_score_all
+            and np.all(np.isin(y_true, [0, 1]))
+            and len(np.unique(y_true)) == 2
+        ):
+            fpr, tpr, thresholds = roc_curve(
+                y_true,
+                np.asarray(self.y_score_all)
+            )
+            results["auc"] = auc(fpr, tpr)
+        else:
+            results["auc"] = None
+
+        return results
