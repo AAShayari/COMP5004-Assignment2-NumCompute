@@ -52,7 +52,7 @@ cd COMP5004-Assignment2-NumCompute
 
 * **macOS / Linux:**
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 ```
@@ -60,7 +60,7 @@ source .venv/bin/activate
 
 * **Windows (PowerShell):**
 ```powershell
-py -3.11 -m venv .venv
+py -3 -m venv .venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 
