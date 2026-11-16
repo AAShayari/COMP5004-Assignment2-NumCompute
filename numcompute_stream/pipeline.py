@@ -16,59 +16,141 @@ class Pipeline:
         if len(names) != len(set(names)):
             raise ValueError("Step names must be unique.")
 
-        # Check that all intermediate steps can transform data.
         for name, step in steps[:-1]:
-            if not hasattr(step, "transform"):
+            if not hasattr(step, "fit") or not hasattr(step, "transform"):
                 raise TypeError(
-                    f"Intermediate step '{name}' must have transform()."
+                    f"Preprocessing step '{name}' must support "
+                    "fit() and transform()."
                 )
 
-        self.steps = steps
-        self._is_fitted = False
+        model_name, model = steps[-1]
 
-    @property
-    def named_steps(self):
-        """Return pipeline steps as a dictionary."""
-        return dict(self.steps)
-
-    def partial_fit(self, X_chunk, y_chunk):
-        """Update transformers and the model using one data chunk."""
-        X_chunk = np.asarray(X_chunk)
-        y_chunk = np.asarray(y_chunk)
-
-        if X_chunk.ndim != 2:
-            raise ValueError("X_chunk must be a 2D array.")
-
-        if y_chunk.ndim != 1:
-            raise ValueError("y_chunk must be a 1D array.")
-
-        if X_chunk.shape[0] == 0:
-            raise ValueError("The data chunk cannot be empty.")
-
-        if X_chunk.shape[0] != len(y_chunk):
-            raise ValueError("X_chunk and y_chunk must have the same number of rows.")
-
-        X_current = X_chunk
-
-        # Update and apply each preprocessing step.
-        for name, step in self.steps[:-1]:
-            if not hasattr(step, "partial_fit"):
-                raise TypeError(
-                    f"Step '{name}' must support partial_fit()."
-                )
-
-            step.partial_fit(X_current)
-            X_current = step.transform(X_current)
-
-        # Update the final model with the transformed data.
-        model_name, model = self.steps[-1]
+        if not hasattr(model, "fit") or not hasattr(model, "predict"):
+            raise TypeError(
+                f"Final step '{model_name}' must support fit() and predict()."
+            )
 
         if not hasattr(model, "partial_fit"):
             raise TypeError(
                 f"Final step '{model_name}' must support partial_fit()."
             )
 
-        model.partial_fit(X_current, y_chunk)
+        self.steps = steps
+
+        # Store raw data until the next model retraining.
+        self.buffer_X = []
+        self.buffer_y = []
+
+        self._is_fitted = False
+        self.n_features_in_ = None
+
+    @property
+    def named_steps(self):
+        """Return pipeline steps as a dictionary."""
+        return dict(self.steps)
+
+    @property
+    def buffered_samples_(self):
+        """Return the number of samples waiting for retraining."""
+        if not self.buffer_X:
+            return 0
+
+        return sum(chunk.shape[0] for chunk in self.buffer_X)
+
+    def _check_data(self, X, y=None):
+        """Validate input features and optional target values."""
+        X = np.asarray(X)
+
+        if X.ndim != 2:
+            raise ValueError("X must be a 2D array.")
+
+        if X.shape[0] == 0:
+            raise ValueError("The data cannot be empty.")
+
+        if self.n_features_in_ is not None:
+            if X.shape[1] != self.n_features_in_:
+                raise ValueError(
+                    "The number of input features must remain consistent."
+                )
+
+        if y is not None:
+            y = np.asarray(y)
+
+            if y.ndim != 1:
+                raise ValueError("y must be a 1D array.")
+
+            if X.shape[0] != len(y):
+                raise ValueError(
+                    "X and y must have the same number of rows."
+                )
+
+        return X, y
+
+    def _transform_features(self, X):
+        """Apply all preprocessing steps in their original order."""
+        X_current = np.asarray(X)
+
+        for name, step in self.steps[:-1]:
+            X_current = step.transform(X_current)
+
+        return X_current
+
+    def _fit_transformers(self, X):
+        """Fit preprocessing steps and transform the training data."""
+        X_current = np.asarray(X)
+
+        for name, step in self.steps[:-1]:
+            step.fit(X_current)
+            X_current = step.transform(X_current)
+
+        return X_current
+
+    def partial_fit(self, X_chunk, y_chunk):
+        """
+        Buffer raw data chunks and retrain when the buffer is full.
+
+        The most recently trained model remains available for prediction
+        while new samples are being collected.
+        """
+        X_chunk, y_chunk = self._check_data(X_chunk, y_chunk)
+
+        # Remember the original number of input features.
+        if self.n_features_in_ is None:
+            self.n_features_in_ = X_chunk.shape[1]
+
+        # Store copies of the original, untransformed data.
+        self.buffer_X.append(X_chunk.copy())
+        self.buffer_y.append(y_chunk.copy())
+
+        model_name, model = self.steps[-1]
+
+        # Use the final model's buffer size as the retraining threshold.
+        buffer_size = getattr(model, "buffer_size", 1)
+
+        if not isinstance(buffer_size, (int, np.integer)):
+            raise ValueError("Model buffer_size must be a positive integer.")
+
+        if buffer_size < 1:
+            raise ValueError("Model buffer_size must be a positive integer.")
+
+        # Wait until enough samples have accumulated.
+        if self.buffered_samples_ < buffer_size:
+            return self
+
+        # Combine all pending raw data.
+        X_all = np.concatenate(self.buffer_X, axis=0)
+        y_all = np.concatenate(self.buffer_y, axis=0)
+
+        # Refit transformers on the complete pending buffer.
+        X_transformed = self._fit_transformers(X_all)
+
+        # Retrain the model using the consistently transformed data.
+        # fit() resets the model's own internal buffer.
+        model.fit(X_transformed, y_all)
+
+        # Clear the pipeline buffer after successful retraining.
+        self.buffer_X = []
+        self.buffer_y = []
 
         self._is_fitted = True
 
@@ -76,104 +158,50 @@ class Pipeline:
 
     def fit(self, X, y):
         """Fit the complete pipeline using a batch of data."""
-        X_current = np.asarray(X)
-        y = np.asarray(y)
+        X, y = self._check_data(X, y)
 
-        if X_current.ndim != 2:
-            raise ValueError("X must be a 2D array.")
+        self.n_features_in_ = X.shape[1]
 
-        if y.ndim != 1:
-            raise ValueError("y must be a 1D array.")
-
-        if X_current.shape[0] == 0:
-            raise ValueError("The training data cannot be empty.")
-
-        if X_current.shape[0] != len(y):
-            raise ValueError("X and y must have the same number of rows.")
-
-        # Fit and transform the preprocessing steps.
-        for name, step in self.steps[:-1]:
-            if not hasattr(step, "fit") or not hasattr(step, "transform"):
-                raise TypeError(
-                    f"Step '{name}' must support fit() and transform()."
-                )
-
-            if hasattr(step, "fit_transform"):
-                X_current = step.fit_transform(X_current)
-            else:
-                step.fit(X_current)
-                X_current = step.transform(X_current)
+        # Fit and apply preprocessing steps.
+        X_transformed = self._fit_transformers(X)
 
         # Fit the final model.
         model_name, model = self.steps[-1]
+        model.fit(X_transformed, y)
 
-        if not hasattr(model, "fit"):
-            raise TypeError(
-                f"Final step '{model_name}' must support fit()."
-            )
-
-        model.fit(X_current, y)
+        # Reset any pending streaming data.
+        self.buffer_X = []
+        self.buffer_y = []
 
         self._is_fitted = True
 
         return self
 
     def transform(self, X):
-        """Apply all pipeline transformations to input data."""
+        """Apply the fitted preprocessing steps to input data."""
         if not self._is_fitted:
             raise RuntimeError("Pipeline is not fitted yet.")
 
-        X_current = np.asarray(X)
+        X, _ = self._check_data(X)
 
-        if X_current.ndim != 2:
-            raise ValueError("X must be a 2D array.")
-
-        # Apply only the preprocessing steps.
-        for name, step in self.steps[:-1]:
-            X_current = step.transform(X_current)
-
-        # The final step must also be a transformer to return
-        # transformed features from the complete pipeline.
-        name, last_step = self.steps[-1]
-
-        if not hasattr(last_step, "transform"):
-            raise AttributeError(
-                f"Final step '{name}' does not support transform()."
-            )
-
-        return last_step.transform(X_current)
+        return self._transform_features(X)
 
     def predict(self, X):
-        """Generate predictions using the fitted pipeline."""
+        """Generate predictions using the most recently trained model."""
         if not self._is_fitted:
             raise RuntimeError("Pipeline is not fitted yet.")
 
-        X_current = np.asarray(X)
+        X, _ = self._check_data(X)
 
-        if X_current.ndim != 2:
-            raise ValueError("X must be a 2D array.")
+        X_transformed = self._transform_features(X)
 
-        # Apply the preprocessing steps in order.
-        for name, step in self.steps[:-1]:
-            X_current = step.transform(X_current)
-
-        # Use the final model to make predictions.
         model_name, model = self.steps[-1]
 
-        if not hasattr(model, "predict"):
-            raise AttributeError(
-                f"Final step '{model_name}' does not support predict()."
-            )
+        return model.predict(X_transformed)
 
-        return model.predict(X_current)
-
-    def fit_transform(self, X, y=None):
-        """Fit and transform a pipeline containing only transformers."""
-        if not hasattr(self.steps[-1][1], "transform"):
-            raise AttributeError(
-                "The final step must support transform() for fit_transform()."
-            )
-
+    def fit_transform(self, X, y):
+        """Fit the pipeline and return transformed features."""
         self.fit(X, y)
 
         return self.transform(X)
+
