@@ -1,114 +1,256 @@
 
-"""NumPy-only decision tree classifier with buffered streaming training."""
-
-from dataclasses import dataclass
-from typing import Any, Optional
-import warnings
+"""Decision tree classifier with buffered streaming training."""
 
 import numpy as np
 
 
-@dataclass
 class _Node:
-    """Represent one node in the decision tree."""
+    """Store information about one node in the tree."""
 
-    prediction: Any
-    feature: Optional[int] = None
-    threshold: Optional[float] = None
-    left: Optional["_Node"] = None
-    right: Optional["_Node"] = None
+    def __init__(self):
+        self.feature = None
+        self.threshold = None
+        self.left = None
+        self.right = None
+        self.value = None
 
 
 class DecisionTreeClassifier:
-    """Decision tree classifier supporting buffered incremental training.
-
-    Parameters
-    ----------
-    max_depth : int
-        Maximum depth of the tree.
-    criterion : str
-        Split criterion: "gini" or "entropy".
-    min_samples_split : int
-        Minimum samples required to split a node.
-    max_features : None, int, float, or str
-        Number of features considered at each split.
-        Supported strings: "sqrt" and "log2".
-    buffer_size : int
-        Number of buffered samples required before retraining.
-    random_state : int or None
-        Seed for reproducible feature selection.
-    """
+    """A simple decision tree classifier with buffered retraining."""
 
     def __init__(
         self,
-        max_depth: int = 5,
-        criterion: str = "gini",
-        min_samples_split: int = 2,
+        max_depth=5,
+        criterion="gini",
+        min_samples_split=2,
         max_features=None,
-        buffer_size: int = 500,
-        random_state=None,
+        buffer_size=500,
+        random_state=None
     ):
-        if not isinstance(max_depth, int) or max_depth < 0:
+        # Validate the configuration.
+        if isinstance(max_depth, bool) or not isinstance(
+            max_depth, (int, np.integer)
+        ) or max_depth < 0:
             raise ValueError("max_depth must be a non-negative integer.")
 
         if criterion not in ("gini", "entropy"):
             raise ValueError("criterion must be 'gini' or 'entropy'.")
 
-        if not isinstance(min_samples_split, int) or min_samples_split < 2:
+        if isinstance(min_samples_split, bool) or not isinstance(
+            min_samples_split, (int, np.integer)
+        ) or min_samples_split < 2:
             raise ValueError("min_samples_split must be an integer >= 2.")
 
-        if not isinstance(buffer_size, int) or buffer_size < 1:
+        if isinstance(buffer_size, bool) or not isinstance(
+            buffer_size, (int, np.integer)
+        ) or buffer_size < 1:
             raise ValueError("buffer_size must be a positive integer.")
 
-        if max_features is not None:
-            if isinstance(max_features, bool):
-                raise TypeError("max_features cannot be a boolean.")
-            if isinstance(max_features, int) and max_features < 1:
-                raise ValueError("Integer max_features must be >= 1.")
-            if isinstance(max_features, float) and not (0 < max_features <= 1):
-                raise ValueError("Float max_features must be in (0, 1].")
-            if isinstance(max_features, str) and max_features not in (
-                "sqrt", "log2"
-            ):
-                raise ValueError(
-                    "String max_features must be 'sqrt' or 'log2'."
-                )
-            if not isinstance(max_features, (int, float, str)):
-                raise TypeError(
-                    "max_features must be None, int, float, 'sqrt', or 'log2'."
-                )
+        if isinstance(max_features, bool):
+            raise ValueError("Invalid max_features value.")
 
-        self.max_depth = max_depth
+        if max_features is not None:
+            if isinstance(max_features, (int, np.integer)):
+                if max_features < 1:
+                    raise ValueError("max_features must be at least 1.")
+
+            elif isinstance(max_features, (float, np.floating)):
+                if not 0 < max_features <= 1:
+                    raise ValueError(
+                        "Float max_features must be in (0, 1]."
+                    )
+
+            elif isinstance(max_features, str):
+                if max_features not in ("sqrt", "log2"):
+                    raise ValueError(
+                        "Use 'sqrt' or 'log2' for max_features."
+                    )
+
+            else:
+                raise TypeError("Invalid max_features value.")
+
+        self.max_depth = int(max_depth)
         self.criterion = criterion
-        self.min_samples_split = min_samples_split
+        self.min_samples_split = int(min_samples_split)
         self.max_features = max_features
-        self.buffer_size = buffer_size
+        self.buffer_size = int(buffer_size)
         self.random_state = random_state
 
-        self._rng = np.random.default_rng(random_state)
+        self.rng = np.random.default_rng(random_state)
 
-        self._root = None
+        self.root = None
         self.classes_ = None
         self.n_features_in_ = None
-        self._impute_values = None
-
-        self._buffer_X = []
-        self._buffer_y = []
-
+        self.impute_values_ = None
         self.is_fitted_ = False
 
-    # ---------------------------------------------------------
-    # Input validation
-    # ---------------------------------------------------------
+        # Store incoming chunks until retraining is required.
+        self.buffer_X = []
+        self.buffer_y = []
 
-    @staticmethod
-    def _validate_xy(X, y):
-        """Validate feature and target arrays."""
+    # --------------------------------------------------
+    # Impurity calculation
+    # --------------------------------------------------
+
+    def _impurity(self, y):
+        """Calculate Gini impurity or entropy."""
+
+        if len(y) == 0:
+            return 0.0
+
+        labels, counts = np.unique(y, return_counts=True)
+        probabilities = counts / len(y)
+
+        if self.criterion == "gini":
+            return 1.0 - np.sum(probabilities ** 2)
+
+        return -np.sum(
+            probabilities * np.log2(probabilities)
+        )
+
+    def _leaf_value(self, y):
+        """Return the most common class label."""
+
+        labels, counts = np.unique(y, return_counts=True)
+        return labels[np.argmax(counts)]
+
+    # --------------------------------------------------
+    # Feature selection
+    # --------------------------------------------------
+
+    def _get_features(self, n_features):
+        """Select the features to consider at a split."""
+
+        if self.max_features is None:
+            count = n_features
+
+        elif self.max_features == "sqrt":
+            count = max(1, int(np.sqrt(n_features)))
+
+        elif self.max_features == "log2":
+            count = max(1, int(np.log2(n_features)))
+
+        elif isinstance(self.max_features, (float, np.floating)):
+            count = max(
+                1,
+                int(np.ceil(self.max_features * n_features))
+            )
+
+        else:
+            count = int(self.max_features)
+
+        if count > n_features:
+            raise ValueError(
+                "max_features cannot exceed the number of features."
+            )
+
+        if count == n_features:
+            return np.arange(n_features)
+
+        return np.sort(
+            self.rng.choice(n_features, count, replace=False)
+        )
+
+    # --------------------------------------------------
+    # Finding the best split
+    # --------------------------------------------------
+
+    def _best_split(self, X, y):
+        """Find the feature and threshold with the lowest impurity."""
+
+        best_feature = None
+        best_threshold = None
+        best_score = self._impurity(y)
+
+        features = self._get_features(X.shape[1])
+
+        for feature in features:
+
+            values = np.unique(X[:, feature])
+
+            if len(values) < 2:
+                continue
+
+            # Try the midpoint between every pair of unique values.
+            thresholds = (
+                values[:-1] / 2.0 + values[1:] / 2.0
+            )
+
+            for threshold in thresholds:
+
+                mask = X[:, feature] <= threshold
+
+                left_y = y[mask]
+                right_y = y[~mask]
+
+                if len(left_y) == 0 or len(right_y) == 0:
+                    continue
+
+                # Calculate weighted impurity.
+                score = (
+                    len(left_y) * self._impurity(left_y)
+                    + len(right_y) * self._impurity(right_y)
+                ) / len(y)
+
+                if score < best_score - 1e-12:
+                    best_feature = feature
+                    best_threshold = threshold
+                    best_score = score
+
+        return best_feature, best_threshold
+
+    # --------------------------------------------------
+    # Building the tree
+    # --------------------------------------------------
+
+    def _build(self, X, y, depth):
+        """Build the decision tree recursively."""
+
+        node = _Node()
+
+        # Check whether this node should become a leaf.
+        if (
+            depth >= self.max_depth
+            or len(np.unique(y)) == 1
+            or len(y) < self.min_samples_split
+        ):
+            node.value = self._leaf_value(y)
+            return node
+
+        feature, threshold = self._best_split(X, y)
+
+        # No useful split was found.
+        if feature is None:
+            node.value = self._leaf_value(y)
+            return node
+
+        mask = X[:, feature] <= threshold
+
+        node.feature = feature
+        node.threshold = threshold
+
+        # Build the left and right branches.
+        node.left = self._build(
+            X[mask], y[mask], depth + 1
+        )
+
+        node.right = self._build(
+            X[~mask], y[~mask], depth + 1
+        )
+
+        return node
+
+    # --------------------------------------------------
+    # Preparing and validating input data
+    # --------------------------------------------------
+
+    def _validate_data(self, X, y):
+        """Check the input feature and target arrays."""
 
         try:
-            X = np.asarray(X, dtype=np.float64)
+            X = np.asarray(X, dtype=float)
         except (TypeError, ValueError) as exc:
-            raise ValueError("X must contain numeric feature values.") from exc
+            raise ValueError("X must contain numeric values.") from exc
 
         y = np.asarray(y)
 
@@ -118,312 +260,136 @@ class DecisionTreeClassifier:
         if y.ndim != 1:
             raise ValueError("y must be a 1D array.")
 
-        if X.shape[0] == 0:
-            raise ValueError("Training data cannot be empty.")
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            raise ValueError("X cannot be empty.")
 
-        if X.shape[1] == 0:
-            raise ValueError("X must contain at least one feature.")
+        if len(X) != len(y):
+            raise ValueError("X and y must have the same number of rows.")
 
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(
-                "X and y must contain the same number of samples."
-            )
+        if np.isinf(X).any():
+            raise ValueError("X cannot contain infinity.")
 
         if y.dtype.kind in "fc":
             if not np.all(np.isfinite(y)):
-                raise ValueError("Class labels cannot contain NaN or infinity.")
+                raise ValueError(
+                    "Class labels cannot contain NaN or infinity."
+                )
 
         if y.dtype.kind == "O":
-            if any(label is None for label in y):
-                raise ValueError("Class labels cannot contain None.")
+            for label in y:
+                if label is None:
+                    raise ValueError(
+                        "Class labels cannot contain None."
+                    )
 
-        if np.isinf(X).any():
-            raise ValueError("X cannot contain positive or negative infinity.")
+                if isinstance(label, (float, np.floating)):
+                    if not np.isfinite(label):
+                        raise ValueError(
+                            "Class labels cannot contain NaN or infinity."
+                        )
+
+        # Ensure class labels can be compared and sorted.
+        try:
+            np.unique(y)
+        except TypeError as exc:
+            raise ValueError(
+                "Class labels must have compatible data types."
+            ) from exc
 
         return X, y
 
-    # ---------------------------------------------------------
-    # Impurity and class calculations
-    # ---------------------------------------------------------
+    def _prepare_features(self, X, calculate_medians=False):
+        """Replace missing feature values with their median."""
 
-    def _impurity_from_counts(self, counts):
-        """Calculate Gini impurity or entropy from class counts."""
+        if calculate_medians:
+            medians = []
 
-        totals = np.sum(counts, axis=-1, keepdims=True)
+            for column in range(X.shape[1]):
+                values = X[:, column]
+                valid_values = values[~np.isnan(values)]
 
-        probabilities = np.divide(
-            counts,
-            totals,
-            out=np.zeros_like(counts, dtype=float),
-            where=totals != 0,
+                if len(valid_values) == 0:
+                    medians.append(0.0)
+                else:
+                    medians.append(np.median(valid_values))
+
+            self.impute_values_ = np.array(medians)
+
+        return np.where(
+            np.isnan(X),
+            self.impute_values_,
+            X
         )
 
-        if self.criterion == "gini":
-            return 1.0 - np.sum(probabilities ** 2, axis=-1)
-
-        positive = probabilities > 0
-
-        terms = np.zeros_like(probabilities)
-        terms[positive] = (
-            probabilities[positive] * np.log2(probabilities[positive])
-        )
-
-        return -np.sum(terms, axis=-1)
-
-    def _impurity(self, y):
-        """Calculate impurity for a group of class labels."""
-
-        _, counts = np.unique(y, return_counts=True)
-        return float(self._impurity_from_counts(counts))
-
-    @staticmethod
-    def _majority(y):
-        """Return the most frequent class."""
-
-        labels, counts = np.unique(y, return_counts=True)
-        return labels[np.argmax(counts)]
-
-    # ---------------------------------------------------------
-    # Feature selection
-    # ---------------------------------------------------------
-
-    def _feature_count(self, n_features):
-        """Determine the number of features to consider."""
-
-        value = self.max_features
-
-        if value is None:
-            return n_features
-
-        if value == "sqrt":
-            return max(1, int(np.sqrt(n_features)))
-
-        if value == "log2":
-            return max(1, int(np.log2(n_features)))
-
-        if isinstance(value, float):
-            return max(1, int(np.ceil(value * n_features)))
-
-        if value > n_features:
-            raise ValueError(
-                "max_features cannot exceed the number of features."
-            )
-
-        return value
-
-    # ---------------------------------------------------------
-    # Best split calculation
-    # ---------------------------------------------------------
-
-    def _best_split(self, X, y):
-        """Find the best feature and threshold using NumPy operations."""
-
-        n_samples, n_features = X.shape
-
-        feature_count = self._feature_count(n_features)
-
-        if feature_count < n_features:
-            features = np.sort(
-                self._rng.choice(
-                    n_features,
-                    size=feature_count,
-                    replace=False,
-                )
-            )
-        else:
-            features = np.arange(n_features)
-
-        _, y_encoded = np.unique(y, return_inverse=True)
-        n_classes = int(np.max(y_encoded)) + 1
-
-        parent_counts = np.bincount(
-            y_encoded, minlength=n_classes
-        ).astype(float)
-
-        parent_impurity = float(
-            self._impurity_from_counts(parent_counts)
-        )
-
-        best_gain = 0.0
-        best_split = None
-
-        for feature in features:
-            values = X[:, feature]
-
-            order = np.argsort(values, kind="stable")
-            sorted_values = values[order]
-            sorted_labels = y_encoded[order]
-
-            # Find positions between distinct feature values.
-            split_positions = np.flatnonzero(
-                sorted_values[:-1] < sorted_values[1:]
-            ) + 1
-
-            if split_positions.size == 0:
-                continue
-
-            # Encode class labels as one-hot counts.
-            one_hot = np.eye(n_classes)[sorted_labels]
-
-            cumulative_counts = np.cumsum(one_hot, axis=0)
-
-            left_counts = cumulative_counts[split_positions - 1]
-            right_counts = parent_counts - left_counts
-
-            left_sizes = split_positions.astype(float)
-            right_sizes = n_samples - left_sizes
-
-            left_impurity = self._impurity_from_counts(left_counts)
-            right_impurity = self._impurity_from_counts(right_counts)
-
-            weighted_impurity = (
-                left_sizes * left_impurity
-                + right_sizes * right_impurity
-            ) / n_samples
-
-            gains = parent_impurity - weighted_impurity
-
-            best_index = int(np.argmax(gains))
-            gain = float(gains[best_index])
-
-            if gain > best_gain + 1e-15:
-                position = split_positions[best_index]
-
-                lower = sorted_values[position - 1]
-                upper = sorted_values[position]
-
-                # Avoid overflow when calculating the midpoint.
-                threshold = lower / 2.0 + upper / 2.0
-
-                best_gain = gain
-                best_split = (int(feature), float(threshold))
-
-        return best_split
-
-    # ---------------------------------------------------------
-    # Recursive tree construction
-    # ---------------------------------------------------------
-
-    def _build(self, X, y, depth):
-        """Build the decision tree recursively."""
-
-        prediction = self._majority(y)
-        node = _Node(prediction=prediction)
-
-        if depth >= self.max_depth:
-            return node
-
-        if y.size < self.min_samples_split:
-            return node
-
-        if np.unique(y).size == 1:
-            return node
-
-        split = self._best_split(X, y)
-
-        if split is None:
-            return node
-
-        feature, threshold = split
-
-        left_mask = X[:, feature] <= threshold
-
-        if not np.any(left_mask) or np.all(left_mask):
-            return node
-
-        node.feature = feature
-        node.threshold = threshold
-
-        node.left = self._build(
-            X[left_mask],
-            y[left_mask],
-            depth + 1,
-        )
-
-        node.right = self._build(
-            X[~left_mask],
-            y[~left_mask],
-            depth + 1,
-        )
-
-        return node
-
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # Training from scratch
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def fit(self, X, y):
         """Train a new decision tree from scratch."""
 
-        X, y = self._validate_xy(X, y)
+        X, y = self._validate_data(X, y)
+
+        if (
+            isinstance(self.max_features, (int, np.integer))
+            and self.max_features > X.shape[1]
+        ):
+            raise ValueError(
+                "max_features cannot exceed the number of features."
+            )
 
         self.n_features_in_ = X.shape[1]
         self.classes_ = np.unique(y)
 
-        # Calculate median values for missing features.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            medians = np.nanmedian(X, axis=0)
+        X = self._prepare_features(X, calculate_medians=True)
 
-        self._impute_values = np.where(
-            np.isnan(medians),
-            0.0,
-            medians,
-        )
+        # Reset the random generator for reproducible training.
+        self.rng = np.random.default_rng(self.random_state)
 
-        X_clean = np.where(
-            np.isnan(X),
-            self._impute_values,
-            X,
-        )
-
-        if not np.all(np.isfinite(X_clean)):
-            raise ValueError("X contains invalid feature values.")
-
-        self._rng = np.random.default_rng(self.random_state)
-
-        self._root = self._build(X_clean, y, depth=0)
+        self.root = self._build(X, y, depth=0)
 
         self.is_fitted_ = True
 
-        # A direct fit starts a fresh training history.
-        self._buffer_X.clear()
-        self._buffer_y.clear()
+        # Clear previously stored chunks after training.
+        self.buffer_X = []
+        self.buffer_y = []
 
         return self
 
-    # ---------------------------------------------------------
-    # Incremental buffered training
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # Incremental training
+    # --------------------------------------------------
 
     def partial_fit(self, X_chunk, y_chunk):
-        """Add a data chunk and retrain when the buffer is full."""
+        """Store a chunk and retrain when the buffer is full."""
 
-        X_chunk, y_chunk = self._validate_xy(X_chunk, y_chunk)
+        X_chunk, y_chunk = self._validate_data(
+            X_chunk, y_chunk
+        )
 
-        if (
-            self.n_features_in_ is not None
-            and X_chunk.shape[1] != self.n_features_in_
-        ):
-            raise ValueError(
-                "Incoming chunk has a different number of features."
-            )
-
-        if self._buffer_X:
-            if X_chunk.shape[1] != self._buffer_X[0].shape[1]:
+        if self.n_features_in_ is not None:
+            if X_chunk.shape[1] != self.n_features_in_:
                 raise ValueError(
-                    "All buffered chunks must have the same feature count."
+                    "The number of features has changed."
                 )
 
-        self._buffer_X.append(X_chunk.copy())
-        self._buffer_y.append(y_chunk.copy())
+        if self.buffer_X:
+            if X_chunk.shape[1] != self.buffer_X[0].shape[1]:
+                raise ValueError(
+                    "Buffered chunks must have the same number of features."
+                )
 
-        buffered = self.buffered_samples_
+        self.buffer_X.append(X_chunk.copy())
+        self.buffer_y.append(y_chunk.copy())
 
-        if buffered >= self.buffer_size:
-            X_all = np.concatenate(self._buffer_X, axis=0)
-            y_all = np.concatenate(self._buffer_y, axis=0)
+        buffered_samples = self.buffered_samples_
 
+        if buffered_samples >= self.buffer_size:
+
+            X_all = np.concatenate(self.buffer_X, axis=0)
+            y_all = np.concatenate(self.buffer_y, axis=0)
+
+            # Retrain using all buffered samples.
             self.fit(X_all, y_all)
 
         return self
@@ -432,68 +398,68 @@ class DecisionTreeClassifier:
     def buffered_samples_(self):
         """Return the number of samples waiting for retraining."""
 
-        return sum(part.shape[0] for part in self._buffer_X)
+        return sum(len(chunk) for chunk in self.buffer_X)
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # Prediction
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def _predict_one(self, row):
-        """Traverse the tree to predict one sample."""
+        """Follow the tree branches to predict one sample."""
 
-        node = self._root
+        node = self.root
 
-        while node.feature is not None:
+        while node.value is None:
+
             if row[node.feature] <= node.threshold:
                 node = node.left
             else:
                 node = node.right
 
-        return node.prediction
+        return node.value
 
     def predict(self, X):
-        """Predict class labels for a feature matrix."""
+        """Predict class labels for new samples."""
 
-        if not self.is_fitted_ or self._root is None:
+        if not self.is_fitted_:
             raise RuntimeError(
-                "DecisionTreeClassifier has not been fitted yet."
+                "The model has not been trained yet."
             )
 
         try:
-            X = np.asarray(X, dtype=np.float64)
+            X = np.asarray(X, dtype=float)
         except (TypeError, ValueError) as exc:
-            raise ValueError("X must contain numeric feature values.") from exc
+            raise ValueError("X must contain numeric values.") from exc
 
         if X.ndim != 2:
             raise ValueError("X must be a 2D array.")
 
         if X.shape[1] != self.n_features_in_:
             raise ValueError(
-                "X has a different number of features from training data."
+                "The number of features does not match training."
             )
 
         if np.isinf(X).any():
-            raise ValueError("X cannot contain positive or negative infinity.")
+            raise ValueError("X cannot contain infinity.")
 
-        X = np.where(
-            np.isnan(X),
-            self._impute_values,
-            X,
-        )
+        X = self._prepare_features(X)
 
-        if X.shape[0] == 0:
+        if len(X) == 0:
             return np.empty(0, dtype=self.classes_.dtype)
 
-        predictions = [
-            self._predict_one(row)
-            for row in X
-        ]
+        predictions = []
 
-        return np.asarray(predictions, dtype=self.classes_.dtype)
+        for row in X:
+            predictions.append(self._predict_one(row))
 
-    # ---------------------------------------------------------
+        return np.asarray(
+            predictions,
+            dtype=self.classes_.dtype
+        )
+
+    # --------------------------------------------------
     # Evaluation
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def score(self, X, y):
         """Calculate classification accuracy."""
@@ -504,12 +470,14 @@ class DecisionTreeClassifier:
         if y.ndim != 1:
             raise ValueError("y must be a 1D array.")
 
-        if y.shape[0] != predictions.shape[0]:
+        if len(y) != len(predictions):
             raise ValueError(
-                "y must have one label for every prediction."
+                "X and y must have the same number of samples."
             )
 
-        if y.size == 0:
-            raise ValueError("Cannot calculate accuracy on empty data.")
+        if len(y) == 0:
+            raise ValueError(
+                "Cannot calculate accuracy on empty data."
+            )
 
         return float(np.mean(predictions == y))
