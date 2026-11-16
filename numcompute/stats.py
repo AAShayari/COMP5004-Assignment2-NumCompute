@@ -362,6 +362,7 @@ class WelfordStats:
 
         Raises
         ------
+        
         ValueError
             If fewer than two observations have been processed.
 
@@ -374,3 +375,179 @@ class WelfordStats:
             raise ValueError("Error: Atleast two observations needed")
 
         return self.M2 / (self.count-1)
+
+
+class StreamingStats:
+    """
+    Calculate statistics incrementally as new data chunks arrive.
+
+    Mean and variance are updated using Welford's algorithm.
+    Observations are retained to calculate exact quantiles
+    and histograms.
+    """
+
+    def __init__(self):
+        self._stats = []
+        self._values = []
+        self.n_features_in_ = None
+
+    def update_stats(self, X_chunk):
+        """
+        Update statistics using a new chunk of observations.
+
+        Parameters
+        ----------
+        X_chunk : array_like
+            New numerical observations. Accepts a 1D or 2D array.
+            Each column represents a feature.
+
+        Returns
+        -------
+        self
+            Updated StreamingStats object.
+        """
+        X_chunk = np.asarray(X_chunk, dtype=float)
+
+        if X_chunk.ndim == 1:
+            X_chunk = X_chunk.reshape(-1, 1)
+
+        if X_chunk.ndim != 2:
+            raise ValueError(
+                "X_chunk must be a 1D or 2D array."
+            )
+
+        if X_chunk.shape[0] == 0 or X_chunk.shape[1] == 0:
+            raise ValueError("X_chunk cannot be empty.")
+
+        if np.any(np.isinf(X_chunk)):
+            raise ValueError(
+                "X_chunk cannot contain infinite values."
+            )
+
+        if self.n_features_in_ is None:
+            self.n_features_in_ = X_chunk.shape[1]
+
+            for _ in range(self.n_features_in_):
+                self._stats.append(WelfordStats())
+                self._values.append([])
+
+        elif X_chunk.shape[1] != self.n_features_in_:
+            raise ValueError(
+                "The number of features must remain consistent."
+            )
+
+        for i in range(self.n_features_in_):
+            column = X_chunk[:, i]
+
+            # Ignore missing values when updating statistics.
+            valid_values = column[~np.isnan(column)]
+
+            if len(valid_values) > 0:
+                self._stats[i].update(valid_values)
+                self._values[i].extend(valid_values.tolist())
+
+        return self
+
+    def mean(self):
+        """Return the running mean of each feature."""
+        return np.array([
+            stat.mean_ if stat.count > 0 else np.nan
+            for stat in self._stats
+        ])
+
+    def variance(self):
+        """Return the running sample variance of each feature."""
+        return np.array([
+            stat.variance if stat.count >= 2 else np.nan
+            for stat in self._stats
+        ])
+
+    def quantiles(self, q):
+        """
+        Calculate exact quantiles for each feature.
+
+        Parameters
+        ----------
+        q : float or array-like
+            Quantile values between 0 and 1.
+
+        Returns
+        -------
+        ndarray
+            Quantile values for each feature.
+        """
+        q_values = np.asarray(q, dtype=float)
+
+        if not np.all(np.isfinite(q_values)) or np.any(
+            (q_values < 0) | (q_values > 1)
+        ):
+            raise ValueError(
+                "Quantiles must be between 0 and 1."
+            )
+
+        results = []
+
+        for values in self._values:
+            if len(values) == 0:
+                results.append(
+                    np.full(q_values.shape, np.nan)
+                )
+            else:
+                results.append(np.quantile(values, q))
+
+        return np.asarray(results)
+
+    def histogram(
+        self,
+        feature=0,
+        bins=10,
+        bin_range=None
+    ):
+        """
+        Calculate a histogram for a selected feature.
+
+        Parameters
+        ----------
+        feature : int
+            Column index of the feature.
+        bins : int or array-like
+            Number of bins or explicit bin edges.
+        bin_range : tuple, optional
+            Lower and upper limits of the histogram range.
+
+        Returns
+        -------
+        counts, bin_edges
+            Histogram counts and bin boundaries.
+        """
+        if self.n_features_in_ is None:
+            raise ValueError(
+                "No data has been processed yet."
+            )
+
+        if not isinstance(feature, (int, np.integer)):
+            raise ValueError("feature must be an integer.")
+
+        if feature < 0 or feature >= self.n_features_in_:
+            raise ValueError("Invalid feature index.")
+
+        if len(self._values[feature]) == 0:
+            raise ValueError(
+                "The selected feature has no valid observations."
+            )
+
+        return histogram(
+            np.asarray(self._values[feature]),
+            bins=bins,
+            bin_range=bin_range
+        )
+
+    def result(self):
+        """Return the current statistics for all features."""
+        return {
+            "count": np.array([
+                stat.count for stat in self._stats
+            ]),
+            "mean": self.mean(),
+            "variance": self.variance()
+        }
