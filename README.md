@@ -32,7 +32,7 @@ NumCompute/
 
 ## Requirements
 
-* Python >= 3.11
+* Python >= 3.10
 * NumPy
 * pytest (for running unit tests)
 
