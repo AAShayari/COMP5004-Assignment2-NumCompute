@@ -231,3 +231,121 @@ Measured using `benchmark/run_benchmarks.py` with a fixed random seed (`42`), av
 | **Softmax** | 100,000 | 32.5353 | 1.5731 | 20.68x |
 
 *Execution environment: Python 3.14.7; NumPy 2.5.4; Windows 11 (10.0.26200); AMD64.*
+
+
+
+---
+
+# Assignment 2.2: Streaming Data Processing
+
+## Overview
+
+The NumCompute toolkit has been extended to support streaming data processing and incremental learning.
+
+The streaming implementation allows data to be processed in smaller chunks rather than requiring the entire dataset to be loaded into memory.
+
+## Streaming Modules
+
+The `numcompute_stream` package provides the following functionality:
+
+| Module | Description |
+|---|---|
+| `stream.py` | StreamTrainer for incremental training, chunk-level evaluation and memory tracking. |
+| `tree.py` | DecisionTreeClassifier with buffered retraining using partial_fit(). |
+| `preprocessing.py` | Incremental StandardScaler, Imputer and OneHotEncoder. |
+| `pipeline.py` | Pipeline supporting incremental transformations and training. |
+| `visualise.py` | Visualisation of metrics, model comparisons and predictions. |
+
+The existing NumCompute package also provides streaming statistics and evaluation utilities through its `stats.py` and `metrics.py` modules.
+
+## Installation
+
+Install the project dependencies using:
+
+```bash
+pip install -e .
+```
+
+The main dependencies are:
+
+- NumPy
+- Matplotlib
+
+## Streaming Usage
+
+The following example demonstrates incremental training using a streaming pipeline.
+
+```python
+import numpy as np
+
+from numcompute_stream.tree import DecisionTreeClassifier
+from numcompute_stream.preprocessing import StandardScaler
+from numcompute_stream.pipeline import Pipeline
+
+# Create a streaming pipeline
+pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("tree", DecisionTreeClassifier(
+        max_depth=3,
+        buffer_size=100
+    ))
+])
+
+# Generate sample data
+X = np.random.rand(200, 2)
+y = (X[:, 0] + X[:, 1] > 1).astype(int)
+
+# Train incrementally
+pipeline.partial_fit(X[:50], y[:50])
+pipeline.partial_fit(X[50:100], y[50:100])
+pipeline.partial_fit(X[100:150], y[100:150])
+pipeline.partial_fit(X[150:], y[150:])
+
+# Make predictions
+predictions = pipeline.predict(X)
+
+print("Predictions:", predictions)
+```
+
+## Streaming Evaluation
+
+The `StreamTrainer` class supports chunk-based training and evaluation.
+
+It records:
+- Training chunks processed.
+- Accuracy for individual chunks.
+- Cumulative accuracy.
+- Estimated memory usage.
+
+The `StreamingMetrics` class supports cumulative and rolling performance metrics, including accuracy, precision, recall, F1-score and confusion matrix calculations.
+
+## Visualisation
+
+The `visualise.py` module provides the following functions:
+
+- `plot_metric_over_time()` – visualises metric changes over time.
+- `compare_models()` – compares the performance of two models.
+- `plot_predictions_vs_ground_truth()` – compares predicted and actual labels.
+
+## Benchmarking
+
+The streaming benchmark is available at:
+
+`benchmark/stream_benchmarks.py`
+
+It compares different buffer sizes based on model accuracy and training time.
+
+Run the benchmark using:
+
+```bash
+python benchmark/stream_benchmarks.py
+```
+
+## Demonstration
+
+The streaming demonstration notebook is available at:
+
+`demo/stream_demo.ipynb`
+
+It demonstrates CSV loading, chunk-based processing, incremental pipeline training, performance evaluation and visualisation.
+
